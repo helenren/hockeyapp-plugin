@@ -5,54 +5,25 @@ import hudson.Extension;
 import hudson.FilePath;
 import hudson.Launcher;
 import hudson.Util;
-import hudson.model.Action;
-import hudson.model.BuildListener;
-import hudson.model.Result;
+import hudson.model.*;
 import hudson.model.AbstractBuild;
-import hudson.model.AbstractProject;
-import hudson.scm.ChangeLogSet.Entry;
-import hudson.tasks.BuildStepDescriptor;
-import hudson.tasks.BuildStepMonitor;
-import hudson.tasks.Publisher;
-import hudson.tasks.Recorder;
+import hudson.tasks.*;
 import hudson.util.RunList;
-
-import java.io.BufferedReader;
-import java.io.File;
-import java.io.FileOutputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.InputStreamReader;
-import java.net.InetSocketAddress;
-import java.net.Proxy;
-import java.net.ProxySelector;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.List;
-import java.util.Map;
-import java.util.Scanner;
-
-import net.sf.json.JSONObject;
-
-import org.apache.commons.collections.CollectionUtils;
 import org.apache.commons.collections.Predicate;
 import org.apache.commons.io.IOUtils;
-import org.apache.commons.io.FileUtils;
-import org.apache.commons.lang.StringUtils;
 import org.apache.http.HttpEntity;
-import org.apache.http.HttpHost;
 import org.apache.http.HttpResponse;
 import org.apache.http.NameValuePair;
-import org.apache.http.client.HttpClient;
 import org.apache.http.client.entity.UrlEncodedFormEntity;
 import org.apache.http.client.methods.HttpPost;
-import org.apache.http.conn.params.ConnRoutePNames;
 import org.apache.http.entity.mime.MultipartEntity;
 import org.apache.http.entity.mime.content.FileBody;
 import org.apache.http.entity.mime.content.StringBody;
 import org.apache.http.impl.client.DefaultHttpClient;
 import org.apache.http.message.BasicNameValuePair;
+import org.apache.http.client.HttpClient;
+import org.apache.http.params.CoreConnectionPNames;
+import org.apache.tools.ant.types.FileSet;
 import org.json.simple.parser.JSONParser;
 import org.kohsuke.stapler.DataBoundConstructor;
 import hudson.scm.ChangeLogSet.Entry;
@@ -83,6 +54,7 @@ public class HockeyappRecorder extends Recorder {
 	@Exported public boolean cleanupOld;
 	@Exported public String numberOldVersions;
 	@Exported public boolean useAppVersionURL;
+	@Exported public boolean debugMode;
 	@Exported public boolean useNotesTypeMarkdown;
     @Exported public String releaseNotesFileName;
 
@@ -92,7 +64,9 @@ public class HockeyappRecorder extends Recorder {
 	public HockeyappRecorder(String apiToken, String appId, boolean notifyTeam,
 			String buildNotes, String filePath, String dsymPath, String tags,
 			boolean downloadAllowed, boolean useChangelog, boolean cleanupOld,
-			String numberOldVersions, boolean useAppVersionURL, boolean useNotesTypeMarkdown, String releaseNotesFileName) {
+			String numberOldVersions, boolean useAppVersionURL, boolean debugMode,
+			boolean useNotesTypeMarkdown, String releaseNotesFileName) {
+
 		this.apiToken = Util.fixEmptyAndTrim(apiToken);
 		this.appId = Util.fixEmptyAndTrim(appId);
 		this.notifyTeam = notifyTeam;
@@ -104,10 +78,11 @@ public class HockeyappRecorder extends Recorder {
 		this.useChangelog = useChangelog;
 		this.cleanupOld = cleanupOld;
 		this.numberOldVersions = Util.fixEmptyAndTrim(numberOldVersions);
-        this.useAppVersionURL = useAppVersionURL;
-        this.useNotesTypeMarkdown = useNotesTypeMarkdown;
-        this.releaseNotesFileName = Util.fixEmptyAndTrim(releaseNotesFileName);
-    }
+		this.useAppVersionURL = useAppVersionURL;
+		this.debugMode = debugMode;
+		this.useNotesTypeMarkdown = useNotesTypeMarkdown;
+		this.releaseNotesFileName = Util.fixEmptyAndTrim(releaseNotesFileName);
+	}
 
 	@Override
 	public DescriptorImpl getDescriptor() {
@@ -116,6 +91,29 @@ public class HockeyappRecorder extends Recorder {
 
 	public BuildStepMonitor getRequiredMonitorService() {
 		return BuildStepMonitor.NONE;
+	}
+
+	// Not a getter since build has to know proper value
+	public String fetchApiToken() {
+		if (this.apiToken == null) {
+			return getDescriptor().getDefaultToken();
+		} else {
+			return this.apiToken;
+		}
+	}
+
+	public boolean isDebugEnabled() {
+		return this.debugMode || this.getDescriptor().getGlobalDebugMode();
+	}
+
+	// create an httpclient with some default settings, including socket timeouts
+	// note that this doesn't solve potential write timeouts
+	// http://stackoverflow.com/questions/1338885/java-socket-output-stream-writes-do-they-block
+	private HttpClient createPreconfiguredHttpClient() {
+		HttpClient httpclient = new DefaultHttpClient();
+		httpclient.getParams().setParameter(CoreConnectionPNames.CONNECTION_TIMEOUT, 60000);
+		httpclient.getParams().setParameter(CoreConnectionPNames.SO_TIMEOUT, 60000);
+		return httpclient;
 	}
 
 	@Override
@@ -134,11 +132,16 @@ public class HockeyappRecorder extends Recorder {
 			tempDir.delete();
 			tempDir.mkdirs();
 
-			File file = getFileLocally(build.getWorkspace(),
-					vars.expand(filePath), tempDir);
+			FileSet fileSet = Util.createFileSet(new File(build.getWorkspace().getRemote()),
+					vars.expand(filePath), null);
+			// Take the first one that matches the pattern
+			File file = new File(fileSet.iterator().next().toString());
 			listener.getLogger().println(file);
 
-			HttpClient httpclient = new DefaultHttpClient();
+			float fileSize = file.length();
+
+			HttpClient httpclient = createPreconfiguredHttpClient();
+
             HttpPost httpPost;
             if(useAppVersionURL) {
                 if (appId == null) {
@@ -153,7 +156,7 @@ public class HockeyappRecorder extends Recorder {
 
             }
 			FileBody fileBody = new FileBody(file);
-			httpPost.setHeader("X-HockeyAppToken", vars.expand(apiToken));
+			httpPost.setHeader("X-HockeyAppToken", vars.expand(fetchApiToken()));
 			MultipartEntity entity = new MultipartEntity();
 			if (useChangelog) {
 			//StringBuilder sb = new StringBuilder(super.buildCompletionMessage(publisher,build,listener));
@@ -184,8 +187,10 @@ public class HockeyappRecorder extends Recorder {
 			entity.addPart("ipa", fileBody);
 
 			if (dsymPath != null) {
-				File dsymFile = getFileLocally(build.getWorkspace(),
-						vars.expand(dsymPath), tempDir);
+				FileSet dsymFileSet = Util.createFileSet(new File(build.getWorkspace().getRemote()),
+					vars.expand(dsymPath), null);
+				// Take the first one that matches the pattern
+				File dsymFile = new File(dsymFileSet.iterator().next().toString());
 				listener.getLogger().println(dsymFile);
 				FileBody dsymFileBody = new FileBody(dsymFile);
 				entity.addPart("dsym", dsymFileBody);
@@ -197,57 +202,34 @@ public class HockeyappRecorder extends Recorder {
 			entity.addPart("status",
 					new StringBody(downloadAllowed ? "2" : "1"));
 			httpPost.setEntity(entity);
-            try {
-               String proxyHost = System.getProperty("https.proxyHost");
-               int proxyPort = 3128;
-               try {
-                    proxyPort = Integer.parseInt(System.getProperty("https.proxyPort"));
-               } catch (Exception ex) {
-                    System.out.println("No proxy port found");
-               }
 
-               System.setProperty("java.net.useSystemProxies", "true");
-
-               ProxySelector ps = ProxySelector.getDefault();
-               List<Proxy> proxyList = ps.select(httpPost.getURI());
-               Proxy proxy = proxyList.get(0);
-               if (proxy != null) {
-                     InetSocketAddress addr = ((InetSocketAddress) proxy.address());
-                     if (addr != null) {
-                         proxyHost = addr.getHostName();
-                         proxyPort = addr.getPort();
-                     }
-               }
-
-               boolean useProxy = proxyHost != null && proxyHost.length() > 0;
-
-               if (useProxy) {
-            	   HttpHost proxyHttpHost = new HttpHost(proxyHost, proxyPort);
-            	   httpclient.getParams().setParameter(ConnRoutePNames.DEFAULT_PROXY, proxyHttpHost);
-               }
-
-            } catch (Exception ex) {
-               ex.printStackTrace();
-            }
+			long startTime = System.currentTimeMillis();
 			HttpResponse response = httpclient.execute(httpPost);
+			long duration = System.currentTimeMillis() - startTime;
+
+			printUploadSpeed(duration, fileSize,listener);
+
 			HttpEntity resEntity = response.getEntity();
 
 			InputStream is = resEntity.getContent();
 
+			String responseBody = IOUtils.toString(is);
 			// Improved error handling.
 			if (response.getStatusLine().getStatusCode() != 201) {
-				String responseBody = new Scanner(is).useDelimiter("\\A")
-						.next();
 				listener.getLogger().println(
 						Messages.UNEXPECTED_RESPONSE_CODE(response.getStatusLine().getStatusCode()));
 				listener.getLogger().println(responseBody);
 				return false;
+			} else if(isDebugEnabled()) { // DEBUG MODE output
+				listener.getLogger().println("RESPONSE: " + responseBody);
 			}
 
 			JSONParser parser = new JSONParser();
 
-			final Map parsedMap = (Map) parser.parse(new BufferedReader(
-					new InputStreamReader(is)));
+			final Map parsedMap = (Map) parser.parse(responseBody);
+
+			// Shadow defined appId for cleanup purposes
+			String appId = (String) parsedMap.get("public_identifier");
 
 			HockeyappBuildAction installAction = new HockeyappBuildAction();
 			installAction.displayName = Messages.HOCKEYAPP_INSTALL_LINK();
@@ -277,7 +259,7 @@ public class HockeyappRecorder extends Recorder {
 					listener.getLogger().println(Messages.ABORTING_CLEANUP());
 					return false;
 				}
-				cleanupOldVersions(listener, vars);
+				cleanupOldVersions(listener, vars,appId);
 			}
 		} catch (Exception e) {
 			e.printStackTrace(listener.getLogger());
@@ -296,6 +278,22 @@ public class HockeyappRecorder extends Recorder {
 
 		return true;
 	}
+
+	private void printUploadSpeed(long duration, float fileSize, BuildListener listener) {
+		Float speed = fileSize/duration;
+		speed *= 8000; // In order to get bits pers second not bytes per miliseconds
+
+		if (Float.isNaN(speed)) listener.getLogger().println("NaN bps");
+
+		String[] units = {"bps", "Kbps", "Mbps", "Gbps"};
+		int idx = 0;
+		while (speed > 1024 && idx <= units.length - 1) {
+			speed /= 1024;
+			idx += 1;
+		}
+		listener.getLogger().println("HockeyApp Upload Speed: " + String.format("%.2f", speed) + units[idx]);
+	}
+
 
 	private static File getFileLocally(FilePath workingDir, String strFile,
 			File tempDir) throws IOException, InterruptedException {
@@ -353,13 +351,13 @@ public class HockeyappRecorder extends Recorder {
 		return actions;
 	}
 
-	private boolean cleanupOldVersions(BuildListener listener, EnvVars vars) {
+	private boolean cleanupOldVersions(BuildListener listener, EnvVars vars, String appId) {
 		try {
-			HttpClient httpclient = new DefaultHttpClient();
+			HttpClient httpclient = createPreconfiguredHttpClient();
 			HttpPost httpPost = new HttpPost(
 			        "https://rink.hockeyapp.net/api/2/apps/" + vars.expand(appId)
 						+ "/app_versions/delete");
-			httpPost.setHeader("X-HockeyAppToken", vars.expand(apiToken));
+			httpPost.setHeader("X-HockeyAppToken", vars.expand(fetchApiToken()));
 			List<NameValuePair> nameValuePairs = new ArrayList<NameValuePair>(1);
 			nameValuePairs.add(new BasicNameValuePair("keep", numberOldVersions));
 			httpPost.setEntity(new UrlEncodedFormEntity(nameValuePairs));
@@ -402,6 +400,30 @@ public class HockeyappRecorder extends Recorder {
 			super(HockeyappRecorder.class);
 			load();
 		}
+
+		public String getDefaultToken() {
+			return defaultToken;
+		}
+
+		@SuppressWarnings("unused") // Used by Jenkins
+		public void setDefaultToken(String defaultToken) {
+			this.defaultToken = defaultToken;
+			save();
+		}
+
+		public boolean getGlobalDebugMode() {
+			return this.globalDebugMode;
+
+		}
+
+		@SuppressWarnings("unused") // Used by Jenkins
+		public void setGlobalDebugMode(boolean globalDebugMode) {
+			this.globalDebugMode = globalDebugMode;
+			save();
+		}
+
+		private String defaultToken;
+		private boolean globalDebugMode = false;
 
 		public boolean isApplicable(Class<? extends AbstractProject> aClass) {
 			// Indicates that this builder can be used with all kinds of project
