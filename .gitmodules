@@ -1,0 +1,12 @@
+[submodule "Submodules/Strings"]
+	path = Submodules/Strings
+	url = git@git.soma.salesforce.com:Localization/L10n-SFOne-Windows.git
+[submodule "Submodules/L10n-SFOneOFS-Windows"]
+	path = Submodules/L10n-SFOneOFS-Windows
+	url = git@git.soma.salesforce.com:Localization/L10n-SFOneOFS-Windows.git
+[submodule "Submodules/SalesforceMobileSDK-Windows"]
+	path = Submodules/SalesforceMobileSDK-Windows
+	url = git@git.soma.salesforce.com:Windows/SalesforceMobileSDK-Windows.git
+[submodule "Submodules/DesignTokens"]
+	path = Submodules/DesignTokens
+	url = git@git.soma.salesforce.com:ux/design-system-ms.git
